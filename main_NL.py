@@ -25,6 +25,7 @@ import pickle
 sys.path.append('models')
 import resnet
 import noisy_folder
+from apex import amp
 
 opt = args.args()
 
@@ -63,7 +64,7 @@ for i, data in enumerate(trainloader, 0):
 	imgs, labels = data
 	mean += torch.from_numpy(np.mean(np.asarray(imgs), axis=(2,3))).sum(0)
 mean = mean / len(trainset)
-##
+## 
 
 transform_train = transforms.Compose(
 	[
@@ -71,7 +72,7 @@ transform_train = transforms.Compose(
     transforms.RandomCrop(opt.imageSize, padding=4),
     transforms.RandomHorizontalFlip(),
 	transforms.ToTensor(),
-    transforms.Normalize((mean[0], mean[1], mean[2]), (1.0, 1.0, 1.0))
+    transforms.Normalize((mean[0], mean[1], mean[2]), (1.0, 1.0, 1.0))  # normalization on all pictures in channel wise, after getting these transform pipeline, the trainset is nolonger necessary.
 	])
 
 transform_test = transforms.Compose(
@@ -88,19 +89,21 @@ with open ('noise/%s/train_labels_n%02d_%s'%(opt.noise_type, opt.noise*000, opt.
     clean_labels = pickle.load(fp)
 with open ('noise/%s/train_labels_n%02d_%s'%(opt.noise_type, opt.noise*100, opt.dataset), 'rb') as fp:
     noisy_labels = pickle.load(fp)
-logger.info(float(np.sum(clean_labels != noisy_labels)) / len(clean_labels))
+logger.info(float(np.sum(clean_labels != noisy_labels)) / len(clean_labels))  # noise rate
 
+print("noisy_labels",noisy_labels)  # ['0' '0' '0' ... '1' '9' '9']
 trainset = noisy_folder.ImageFolder(root='{}/{}/train'.format(opt.dataroot, opt.dataset), 
 	noisy_labels=noisy_labels, transform = transform_train)
 testset = dset.ImageFolder(root='{}/{}/test'.format(opt.dataroot, opt.dataset), 
 	transform=transform_test)
 
+# use formal computed transform pipeline as pre-processing
 clean_labels = list(clean_labels.astype(int))
 noisy_labels = list(noisy_labels.astype(int))
 
 inds_noisy = np.asarray([ind for ind in range(len(trainset)) if trainset.imgs[ind][-1] != clean_labels[ind]])
 inds_clean = np.delete(np.arange(len(trainset)), inds_noisy)
-print(len(inds_noisy))
+print(len(inds_noisy)) # 4500
 
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=opt.batchSize,
                                           shuffle=True, num_workers=opt.workers)
@@ -115,6 +118,7 @@ weight = torch.FloatTensor(num_classes).zero_() + 1.
 for i in range(num_classes):
 	weight[i] = (torch.from_numpy(np.array(trainset.imgs)[:,1].astype(int)) == i).sum()
 weight = 1 / (weight / weight.max())
+# NOTE:compute weight for unbalance training by using a weight come from dataset distributuion
 
 criterion  	  = nn.CrossEntropyLoss(weight=weight)
 criterion_nll = nn.NLLLoss()
@@ -128,7 +132,13 @@ criterion_nr .cuda()
 optimizer = optim.SGD(net.parameters(), 
 	lr=opt.lr, momentum=opt.momentum, weight_decay=opt.weight_decay)
 
+# Initialization
+opt_level = 'O1'
+net, optimizer = amp.initialize(net, optimizer, opt_level=opt_level)
 train_preds  	  = torch.zeros(len(trainset), num_classes) - 1.
+
+# train_preds: all -1.0
+
 num_hist = 10
 train_preds_hist  = torch.zeros(len(trainset), num_hist, num_classes)
 pl_ratio = 0.; nl_ratio = 1.-pl_ratio
@@ -154,6 +164,7 @@ for epoch in range(epoch_resume, opt.max_epochs):
 	train_loss = train_loss_neg = train_acc = 0.0
 	pl = 0.; nl = 0.; 
 	if epoch in opt.epoch_step:
+		# manual learning rate decreasing
 		for param_group in optimizer.param_groups:
 			param_group['lr'] *= 0.1
 			opt.lr = param_group['lr']
@@ -162,31 +173,42 @@ for epoch in range(epoch_resume, opt.max_epochs):
 
 		net.zero_grad()
 		imgs, labels, index = data
-		labels_neg = (labels.unsqueeze(-1).repeat(1, opt.ln_neg)
+		# NOTE: when get a correct label, random sample a different label as neg label
+		## labels = tensor([2, 1, 3, 7, 1, 4, 1, 1, 0, 4])
+		## labels_neg=tensor([[9],[7],[7],[0],[0],[7],[0],[9],[3],[3]])
+		labels_neg = (labels.unsqueeze(-1).repeat(1, opt.ln_neg) # ln_neg: number of negative labels on single image for training (ex. 110 for cifar100), default = 1
 		+ torch.LongTensor(len(labels), opt.ln_neg).random_(1, num_classes)) % num_classes
-		
+		print("labels = {}\n labels_neg={}\n".format(labels[:10], labels_neg[:10]))
+
+		# limitation to negative label
 		assert labels_neg.max() <= num_classes-1 
 		assert labels_neg.min() >= 0
-		assert (labels_neg != labels.unsqueeze(-1).repeat(1, opt.ln_neg)).sum() == len(labels)*opt.ln_neg
+		# assert all label are negative label that not equal to correct label
+		assert (labels_neg != labels.unsqueeze(-1).repeat(1, opt.ln_neg)).sum() == len(labels)*opt.ln_neg 
 
 		imgs = Variable(imgs.cuda()); labels = Variable(labels.cuda()); 
 		labels_neg = Variable(labels_neg.cuda())
 
 		logits = net(imgs)
 
-		##
+		## NOTE: Negative softmax loss:  log(1 - softmax(x))
 		s_neg = torch.log( torch.clamp(1.-F.softmax(logits, -1), min=1e-5, max=1.) )
 		s_neg *= weight[labels].unsqueeze(-1).expand(s_neg.size()).cuda()
+		print("s_neg = {}\n ".format(s_neg[:10]))
 
+		# nothing important, just print argmax label
 		_, pred = torch.max(logits.data, -1)
 		acc = float((pred==labels.data).sum()) 
 		train_acc += acc
 
+		print("train_preds = {}\n train_preds_hist = {}\n train_losses = {}\n".format(train_preds.shape, train_preds_hist.shape, train_losses[:10]))
+		# compute pos loss(with CrossEntropyLoss) and neg loss(with criterion_nll and Neg_softmax) 
 		train_loss     += imgs.size(0)*criterion    (logits, labels         ).data
 		train_loss_neg += imgs.size(0)*criterion_nll(s_neg , labels_neg[:,0]).data
+		# compute CrossEntropyLoss for each sample( without reduction)
 		train_losses[index] = criterion_nr(logits, labels).cpu().data
 		##
-
+		1/0
 		if epoch >= opt.switch_epoch:
 			if epoch == opt.switch_epoch and i == 0: logger.info('Switch to SelNL') 
 			labels_neg[ train_preds_hist.mean(1)[index, labels] < 1/float(num_classes) ] = -100
@@ -197,7 +219,11 @@ for epoch in range(epoch_resume, opt.max_epochs):
 		loss     = criterion    (logits    					, labels      					      ) * float((labels    >=0).sum())
 		loss_neg = criterion_nll(s_neg.repeat(opt.ln_neg, 1), labels_neg.t().contiguous().view(-1)) * float((labels_neg>=0).sum())
 
-		( (loss+loss_neg) / (float((labels>=0).sum())+float((labels_neg[:,0]>=0).sum())) ).backward()
+		# NOTE: loss + negtive loss !!! with batchsize normalization
+		zy_loss = ( (loss+loss_neg) / (float((labels>=0).sum())+float((labels_neg[:,0]>=0).sum())) )
+		with amp.scale_loss(zy_loss, optimizer) as scaled_loss:
+			scaled_loss.backward()
+		
 		optimizer.step()
 
 		train_preds[index.cpu()] = F.softmax(logits, -1).cpu().data
